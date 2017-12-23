@@ -1,0 +1,5 @@
+six
+aiohttp
+motor
+requests
+pymongo>=3.6.0

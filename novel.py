@@ -180,6 +180,7 @@ def rename_floder(dirname):
     return dirname.replace('/', '／').replace('?', '？').replace(':', '：')\
             .replace('*', '＊').replace('"', ' ').replace('|', ' ')
 
+
 def parse_chapter(resp_chapter):
     if 'title' in resp_chapter:
         title = resp_chapter['title']
@@ -198,8 +199,8 @@ def unify_resp_chapter(resp_chapter):
     if 'title' in resp_chapter:
         title = resp_chapter['title']
         content = resp_chapter['cpContent']
-        logger.info('resp_chapter ::::: %s ' % resp_chapter)
-        raise Exception('EXIT')
+        # logger.info('resp_chapter ::::: %s ' % resp_chapter)
+        # raise Exception('EXIT')
     elif 'chapter' in resp_chapter:
         title = resp_chapter['chapter']['title']
         content = resp_chapter['chapter']['body']
@@ -208,29 +209,30 @@ def unify_resp_chapter(resp_chapter):
 
     return title, content
 
-import pdb
-
 
 def unify_resp_chapters(resp_chapters):
     if 'chapters' in resp_chapters:
         c_info = resp_chapters
-        pdb.set_trace()
         if 'ok' in c_info:
             del c_info['ok'] 
     elif 'mixToc' in resp_chapters:
         c_info = resp_chapters['mixToc']
     else:
-        logger.error('Error get chapters, book id: %s' % book_id)
+        raise Exception('error format %s' % resp_chapters)
 
     return c_info
 
 
-async def download_book(api, book):
-    book_id, book_title = book['_id'], book['title']
+
+async def download_book_separately(api, book):
+    '''
+    download book's chapters in separated book folder, with different txt files
+    '''
+    book_id, book_title = book['_id'], rename_floder(book['title'])
 
     logger.info('Download book: %s(%s)' % (book_title, book_id) )
 
-    download_dir = os.path.join(BASE_DOWNLOAD_DIR, book['major'], rename_floder(book_title))
+    download_dir = os.path.join(BASE_DOWNLOAD_DIR, book['major'], book_title)
 
     if not os.path.exists(download_dir):
         os.makedirs(download_dir)
@@ -246,7 +248,7 @@ async def download_book(api, book):
     resp_chapters = unify_resp_chapters(resp_chapters)
     chapters = resp_chapters['chapters']
 
-    await upsert('bookchapters', resp_chapters)
+    await insert_not_exist('bookchapters', resp_chapters)
 
 
     tasks = []
@@ -262,10 +264,60 @@ async def download_book(api, book):
             with codecs.open(path, 'w' , 'utf-8') as f:
                 f.write(content)
 
+
+async def download_book(api, book):
+    book_id, book_title = book['_id'], rename_floder(book['title'])
+
+    logger.info('Download book: %s(%s)' % (book_title, book_id) )
+
+    download_dir = BASE_DOWNLOAD_DIR
+    ensure_dir_exists(download_dir)
+    
+    resp_chapters = await api.book_chapters(book_id)
+    if not resp_chapters:
+        logger.error('Can not download %s' % book_title)
+        return False
+
+    resp_chapters = unify_resp_chapters(resp_chapters)
+    chapters = resp_chapters['chapters']
+
+    await upsert('bookchapters', resp_chapters)
+
+    tasks = []
+    for idx, chap in enumerate(chapters):
+        # resp_chapter = await api.chapter_content(chap['link'])
+        task = asyncio.ensure_future(api.chapter_content(chap['link']))
+        tasks.append(task)
+
+    responses = await asyncio.gather(*tasks)
+
+    chapter_texts =[]
+    for resp_chapter in responses:
+        if resp_chapter:
+            title, content = parse_chapter(resp_chapter)
+            resp_chapter['link'] = chap['link']
+            await db['chapter'].update_one({'link': chap['link']},  {'$setOnInsert': resp_chapter}, upsert=True)
+
+            chapter_texts.append(content)
+
+    path = os.path.join(download_dir, '{0}.txt'.format(book_title))
+
+    with codecs.open(path, 'w' , 'utf-8') as f:
+        f.write('\n\n'.join(chapter_texts))
+
+    return True
+
+
+async def insert_not_exist(col_name, obj):
+    _id = ObjectId(obj['_id'])
+    del obj['_id']
+    await db[col_name].insert_one({"_id": _id}, {'$setOnInsert': obj}, upsert=True)
+
+
 async def upsert(col_name, obj):
     _id = ObjectId(obj['_id'])
     del obj['_id']
-    await db[col_name].replace_one({"_id": _id}, obj, upsert=True)
+    await db[col_name].update_one({"_id": _id}, {'$set': obj}, upsert=True)
 
 
 async def download_books(api, gender, major, type, start=0, limit=20):
@@ -275,9 +327,16 @@ async def download_books(api, gender, major, type, start=0, limit=20):
 
     if result:
         for book in result['books']:
-            await download_book(api, book)
-            book['gender'] = gender
-            await upsert('book', book)
+
+            existed = await db['book'].find_one({'_id': ObjectId(book['_id'])})
+
+            if existed:
+                logger.info('Skip %s' % book['title'])
+            else:
+                succeeded = await download_book(api, book)
+                if succeeded:
+                    book['gender'] = gender
+                    await upsert('book', book)
 
         try:
             if result['total'] > start:
@@ -299,10 +358,10 @@ async def main():
     # await download_books(api, 'male', '玄幻', 'hot', 0)
     sub_cats = []
     tasks = []
-    for k, v in cats.iteritems():
-        sub_cats.extend(c['name'] for c in v)
-        for sub in v:
-            await download_books(api, k, sub, 'hot', 0)
+    for k, v in cats.items():
+        # sub_cats.extend(c['name'] for c in v)
+        for c in v:
+            await download_books(api, k, c['name'], 'hot', 0)
             # task = asyncio.ensure_future(download_books(api, k, sub, 'hot', 0))
             # tasks.append(task)
 
@@ -311,18 +370,8 @@ mgclient = motor.motor_asyncio.AsyncIOMotorClient('mongodb://localhost:27017')
 db = mgclient['bookdb']
 book_col = db['book']
 chapter_col = db['chapter']
+chapter_col.create_index('link')
 
-
-# Traceback (most recent call last):
-#   File "novel.py", line 21, in <module>
-#     import motor.motor_asyncio
-#   File "D:\Anaconda3\envs\py3\lib\site-packages\motor\__init__.py", line 56, in <module>
-#     from .motor_tornado import *
-#   File "D:\Anaconda3\envs\py3\lib\site-packages\motor\motor_tornado.py", line 19, in <module>
-#     from . import core, motor_gridfs
-#   File "D:\Anaconda3\envs\py3\lib\site-packages\motor\core.py", line 34, in <module>
-#     from pymongo.change_stream import ChangeStream
-# ModuleNotFoundError: No module named 'pymongo.change_stream'
 
 if __name__ == '__main__':
 
