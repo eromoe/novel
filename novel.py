@@ -24,7 +24,7 @@ from config import BASE_DOWNLOAD_DIR
 
 
 # PYTHONASYNCIODEBUG=1
-logging.getLogger('asyncio').setLevel(logging.ERROR)
+# logging.getLogger('asyncio').setLevel(logging.ERROR)
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__file__)
 formatter = logging.Formatter(
@@ -91,27 +91,30 @@ class BookApi(object):
 
 
 async def api_get(url, params=None, data=None):
-    async with ClientSession() as session:
-        async with session.get(url, params=params, data=data) as r:
-            if r.status != 200:
-                try:
-                    result = await r.json()
-                    if '你正在使用的版本已不再提供支持' in result['body']:
-                        logger.error('Request %s failed, API not support' % url)
-                    else:
-                        logger.error('Request %s failed, detail: %s' % (url, result))
-                except Exception as e:
-                    logger.error('Request %s failed' % url)
+    # 
 
-                return None
-            # 这里拿到session 还没有开始读内容，读内容又是一个ansync 操作
+    async with sem:
+        async with ClientSession() as session:
+            async with session.get(url, params=params, data=data) as r:
+                if r.status != 200:
+                    try:
+                        result = await r.json()
+                        if '你正在使用的版本已不再提供支持' in result['body']:
+                            logger.error('Request %s failed, API not support' % url)
+                        else:
+                            logger.error('Request %s failed, detail: %s' % (url, result))
+                    except Exception as e:
+                        logger.error('Request %s failed' % url)
 
-            result = await r.json()
-            if result['ok'] == False:
-                logger.error('Request api false , url: %s , result:%s ' % (url, result) )
-                return None
+                    return None
+                # 这里拿到session 还没有开始读内容，读内容又是一个ansync 操作
 
-            return result
+                result = await r.json()
+                if result['ok'] == False:
+                    logger.error('Request api false , url: %s , result:%s ' % (url, result) )
+                    return None
+
+                return result
 
 
 class AsyncBookApi(object):
@@ -151,10 +154,17 @@ class AsyncBookApi(object):
         return await api_get(self.base_url + path)
 
     async def book_chapters(self, id, legal=False):
-        return await api_get(self.base_url + '/mix-atoc/%s?view=chapters' % id)
+        resp = await api_get(self.base_url + '/mix-atoc/%s?view=chapters' % id)
+        if resp:
+            resp = unify_resp_chapters(resp)
+        return resp
 
     async def chapter_content(self, chapter_link):
-        return await api_get(self.chapter_url + '/chapter/' + quote(chapter_link, safe=':'))
+        resp = await api_get(self.chapter_url + '/chapter/' + quote(chapter_link, safe=':'))
+        if resp:
+            resp = unify_resp_chapter(resp)
+            resp['link'] = chapter_link
+        return resp
 
 
 
@@ -197,17 +207,20 @@ def parse_chapter(resp_chapter):
 
 def unify_resp_chapter(resp_chapter):
     if 'title' in resp_chapter:
-        title = resp_chapter['title']
-        content = resp_chapter['cpContent']
+        resp_chapter['content'] = resp_chapter['cpContent']
+        del resp_chapter['cpContent']
+        # title = resp_chapter['title']
+        # content = resp_chapter['cpContent']
         # logger.info('resp_chapter ::::: %s ' % resp_chapter)
         # raise Exception('EXIT')
     elif 'chapter' in resp_chapter:
-        title = resp_chapter['chapter']['title']
-        content = resp_chapter['chapter']['body']
+        resp_chapter = resp_chapter['chapter']
+        resp_chapter['content'] = resp_chapter['body']
+        del resp_chapter['body']
     else:
         raise Exception('Not see', resp_chapter)
 
-    return title, content
+    return resp_chapter
 
 
 def unify_resp_chapters(resp_chapters):
@@ -258,52 +271,46 @@ async def download_book_separately(api, book):
             title, content = parse_chapter(resp_chapter)
             
             resp_chapter['link'] = chap['link']
-            await db['chapter'].replace_one({'link': chap['link']}, resp_chapter, upsert=True)
+            await db['chapter'].insert_one({'link': chap['link']}, resp_chapter, upsert=True)
 
             path = os.path.join(download_dir, '{0:0>5d}.txt'.format(idx+1))
             with codecs.open(path, 'w' , 'utf-8') as f:
                 f.write(content)
 
 
-async def download_book(api, book):
+async def download_book(api, book, download_each_chapter=True):
     book_id, book_title = book['_id'], rename_floder(book['title'])
 
     logger.info('Download book: %s(%s)' % (book_title, book_id) )
 
-    download_dir = BASE_DOWNLOAD_DIR
-    ensure_dir_exists(download_dir)
-    
     resp_chapters = await api.book_chapters(book_id)
     if not resp_chapters:
         logger.error('Can not download %s' % book_title)
         return False
 
-    resp_chapters = unify_resp_chapters(resp_chapters)
-    chapters = resp_chapters['chapters']
-
     await upsert('bookchapters', resp_chapters)
 
-    tasks = []
-    for idx, chap in enumerate(chapters):
-        # resp_chapter = await api.chapter_content(chap['link'])
-        task = asyncio.ensure_future(api.chapter_content(chap['link']))
-        tasks.append(task)
+    if download_each_chapter:
 
-    responses = await asyncio.gather(*tasks)
+        tasks = []
+        for idx, chap in enumerate(resp_chapters['chapters']):
+            # resp_chapter = await api.chapter_content(chap['link'])
+            task = asyncio.ensure_future(api.chapter_content(chap['link']))
+            tasks.append(task)
 
-    chapter_texts =[]
-    for resp_chapter in responses:
-        if resp_chapter:
-            title, content = parse_chapter(resp_chapter)
-            resp_chapter['link'] = chap['link']
-            await db['chapter'].update_one({'link': chap['link']},  {'$setOnInsert': resp_chapter}, upsert=True)
+        responses = await asyncio.gather(*tasks)
 
-            chapter_texts.append(content)
+        chapter_texts =[]
+        for resp_chapter in responses:
+            if resp_chapter:
+                await db['chapter'].update_one({'link': resp_chapter['link']},  {'$setOnInsert': resp_chapter}, upsert=True)
 
-    path = os.path.join(download_dir, '{0}.txt'.format(book_title))
+                chapter_texts.append(resp_chapter['content'])
 
-    with codecs.open(path, 'w' , 'utf-8') as f:
-        f.write('\n\n'.join(chapter_texts))
+        path = os.path.join(BASE_DOWNLOAD_DIR, '{0}.txt'.format(book_title))
+
+        with codecs.open(path, 'w' , 'utf-8') as f:
+            f.write('\n\n'.join(chapter_texts))
 
     return True
 
@@ -320,8 +327,8 @@ async def upsert(col_name, obj):
     await db[col_name].update_one({"_id": _id}, {'$set': obj}, upsert=True)
 
 
-async def download_books(api, gender, major, type, start=0, limit=20):
-    logger.debug('Download gender: %s , major %s' % (gender, major))
+async def download_books(api, gender, major, type, start=0, limit=50):
+    logger.debug('Download Page:%s, Size:%s  ----  gender(%s) , major (%s)' % (start, limit, gender, major))
 
     result = await api.books_by_cat(gender=gender, major=major, type=type, start=start, limit=limit)
 
@@ -333,7 +340,7 @@ async def download_books(api, gender, major, type, start=0, limit=20):
             if existed:
                 logger.info('Skip %s' % book['title'])
             else:
-                succeeded = await download_book(api, book)
+                succeeded = await download_book(api, book, download_each_chapter=False)
                 if succeeded:
                     book['gender'] = gender
                     await upsert('book', book)
@@ -347,7 +354,7 @@ async def download_books(api, gender, major, type, start=0, limit=20):
 
 
 async def main():
-    api = AsyncBookApi('http://api.zhuishushenqi.com', 'http://chapter2.zhuishushenqi.com')
+    api = AsyncBookApi('https://api.zhuishushenqi.com', 'http://chapter2.zhuishushenqi.com')
 
     cats = await api.get_cats()
     top_cats = ['male', 'female', 'picture', 'press']
@@ -355,31 +362,60 @@ async def main():
     # press 是出版社
 
     # await download_books(api, 'press', '传记名著', 'hot', 0)
-    # await download_books(api, 'male', '玄幻', 'hot', 0)
+
+    # print([c for c in cats['press'] if c['name'] == '育儿健康'])
+    # print(cats['press'][-1])
+    # await download_books(api, 'press', '育儿健康', 'hot', 0)
+
+    # 最后一个是育儿健康， 报错 应该是结束了吧
+    # Traceback (most recent call last):
+    # File "novel.py", line 392, in <module>
+    #     loop.run_until_complete(future)
+    # File "D:\Anaconda3\envs\py3\lib\asyncio\base_events.py", line 466, in run_until_complete
+    #     return future.result()
+    # File "novel.py", line 369, in main
+    #     for c in v:
+    # TypeError: 'bool' object is not iterable
+    # ERROR:asyncio:Unclosed client session
+    # client_session: <aiohttp.client.ClientSession object at 0x0000000004A6EB00>
+    # ERROR:asyncio:Unclosed connector
+    # connections: ['[(<aiohttp.client_proto.ResponseHandler object at 0x00000000037E3AC8>, 17202.089)]']
+    # connector: <aiohttp.connector.TCPConnector object at 0x0000000004A6EB38>
+
+
     sub_cats = []
     tasks = []
     for k, v in cats.items():
         # sub_cats.extend(c['name'] for c in v)
-        for c in v:
-            await download_books(api, k, c['name'], 'hot', 0)
-            # task = asyncio.ensure_future(download_books(api, k, sub, 'hot', 0))
-            # tasks.append(task)
+        if k =='female':
+            for c in v:
+                await download_books(api, k, c['name'], 'hot', 0)
 
 
 mgclient = motor.motor_asyncio.AsyncIOMotorClient('mongodb://localhost:27017')
+sem = asyncio.Semaphore(1000)
+session = ClientSession()
 db = mgclient['bookdb']
 book_col = db['book']
 chapter_col = db['chapter']
 chapter_col.create_index('link')
 
 
+
 if __name__ == '__main__':
+    
 
     loop = asyncio.get_event_loop()
-    loop.set_debug(True)
+    # loop.set_debug(True)
     
     # client = ClientSession(loop=loop)
     # future = asyncio.ensure_future(api.api_get('/cats/lv2/statistics'))
     future = asyncio.ensure_future(main())
     loop.run_until_complete(future)
+    session.close()
 
+# api = BookApi('https://api.zhuishushenqi.com')
+# ret = api.books_by_cat(gender='female', major='古代言情', type='hot', start=0, limit=20)
+# import pdb
+
+# pdb.set_trace()
