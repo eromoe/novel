@@ -407,10 +407,10 @@ async def main():
     tasks = []
     for k, v in cats.items():
         # sub_cats.extend(c['name'] for c in v)
-        if k == 'press':
-            for c in v:
-                for t in types:
-                    await download_books(api, k, c['name'], t, 0)
+        # if k == 'press':
+        for c in v:
+            for t in types:
+                await download_books(api, k, c['name'], t, 0)
 
 
 mgclient = motor.motor_asyncio.AsyncIOMotorClient('mongodb://localhost:27017')
