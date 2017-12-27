@@ -22,11 +22,14 @@ import motor.motor_asyncio
 
 from config import BASE_DOWNLOAD_DIR
 
+logging.basicConfig(level=logging.DEBUG)
 
 # PYTHONASYNCIODEBUG=1
-# logging.getLogger('asyncio').setLevel(logging.ERROR)
-logging.basicConfig(level=logging.DEBUG)
+logging.getLogger('asyncio').setLevel(logging.ERROR)
+# logger = logging.getLogger('asyncio')
+# logger.handlers = []
 logger = logging.getLogger(__file__)
+
 formatter = logging.Formatter(
     '[%(levelname)s]'
     '  %(asctime)s %(levelname)s: %(message)s '
@@ -38,7 +41,7 @@ detail_formatter = logging.Formatter(
 stream_handler = logging.StreamHandler()
 stream_handler.setLevel(logging.DEBUG)
 stream_handler.setFormatter(formatter)
-file_handler = RotatingFileHandler('novel.log', maxBytes=100000, backupCount=10)
+file_handler = RotatingFileHandler('novel.log', maxBytes=1024*1024, backupCount=2)
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(detail_formatter)
 logger.addHandler(stream_handler)
@@ -91,11 +94,12 @@ class BookApi(object):
 
 
 async def api_get(url, params=None, data=None):
-    # 
-
     async with sem:
         async with ClientSession() as session:
             async with session.get(url, params=params, data=data) as r:
+                # logger.debug('Request Url: %s' % urljoin(url,  quote_plus(params)))
+                logger.debug('Request Url: %s' % r.url)
+                
                 if r.status != 200:
                     try:
                         result = await r.json()
@@ -117,6 +121,8 @@ async def api_get(url, params=None, data=None):
                 return result
 
 
+from requests.compat import urljoin, quote_plus
+
 class AsyncBookApi(object):
     def __init__(self, base_url, chapter_url):
         self.base_url = base_url
@@ -136,11 +142,15 @@ class AsyncBookApi(object):
         minor: 小类别 从接口4获取 (非必填)
         start: 分页开始页
         limit: 分页条数
+
+        注意，参数顺序有关
         '''
+
+
 
         # must pass  gender, major
 
-        return await api_get(self.base_url + '/book/by-categories', params=kwargs)
+        return await api_get(self.base_url + '/book/by-categories?gender={gender}&type={type}&major={major}&start={start}&limit={limit}'.format(**kwargs))
 
     async def book_info(self, id):
         return await api_get(self.base_url + '/book/'+id)
@@ -327,12 +337,18 @@ async def upsert(col_name, obj):
     await db[col_name].update_one({"_id": _id}, {'$set': obj}, upsert=True)
 
 
-async def download_books(api, gender, major, type, start=0, limit=50):
+async def download_books(api, gender, major, type, start=0, limit=50, total=-1):
     logger.debug('Download Page:%s, Size:%s  ----  gender(%s) , major (%s)' % (start, limit, gender, major))
 
     result = await api.books_by_cat(gender=gender, major=major, type=type, start=start, limit=limit)
 
+    # api 请求会失败，有的时候第一个就失败，导致后面都没抓
+
     if result:
+
+        if total == -1:
+            total = result['total']
+
         for book in result['books']:
 
             existed = await db['book'].find_one({'_id': ObjectId(book['_id'])})
@@ -346,8 +362,8 @@ async def download_books(api, gender, major, type, start=0, limit=50):
                     await upsert('book', book)
 
         try:
-            if result['total'] > start:
-                await download_books(api, gender, major, type, start+limit)
+            if total > start:
+                await download_books(api, gender, major, type, start=start+limit, total=total)
         except Exception as e:
             logger.error('Api books_by_cat fail:%s, maybe no more results' % result)
             return
@@ -360,6 +376,10 @@ async def main():
     top_cats = ['male', 'female', 'picture', 'press']
     print('Top cats: ' , top_cats)
     # press 是出版社
+
+
+    # 空白有的能搜出来有的不行，搞不懂，全部试一遍
+    types = ['', 'hot', 'new', 'repulation', 'over', 'month']
 
     # await download_books(api, 'press', '传记名著', 'hot', 0)
 
@@ -387,14 +407,15 @@ async def main():
     tasks = []
     for k, v in cats.items():
         # sub_cats.extend(c['name'] for c in v)
-        if k =='female':
+        if k == 'press':
             for c in v:
-                await download_books(api, k, c['name'], 'hot', 0)
+                for t in types:
+                    await download_books(api, k, c['name'], t, 0)
 
 
 mgclient = motor.motor_asyncio.AsyncIOMotorClient('mongodb://localhost:27017')
 sem = asyncio.Semaphore(1000)
-session = ClientSession()
+# session = ClientSession()
 db = mgclient['bookdb']
 book_col = db['book']
 chapter_col = db['chapter']
@@ -412,7 +433,7 @@ if __name__ == '__main__':
     # future = asyncio.ensure_future(api.api_get('/cats/lv2/statistics'))
     future = asyncio.ensure_future(main())
     loop.run_until_complete(future)
-    session.close()
+    # session.close()
 
 # api = BookApi('https://api.zhuishushenqi.com')
 # ret = api.books_by_cat(gender='female', major='古代言情', type='hot', start=0, limit=20)
