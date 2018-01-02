@@ -3,6 +3,7 @@ output
 novel/
 venv
 *.log
+*.log.*
 
 ##  Developer
 .mr.developer.cfg
